@@ -1,15 +1,14 @@
-use alloc::vec;
-use core::mem::{self, MaybeUninit};
+use alloc::vec::Vec;
 use log::warn;
 use uefi::{
-    prelude::BootServices,
-    proto::tcg::{v2, EventType, PcrIndex},
-    table::boot::ScopedProtocol,
+    ResultExt,
+    boot::{self, ScopedProtocol},
+    proto::tcg::{EventType, PcrIndex, v2},
 };
 
-fn open_capable_tpm2(boot_services: &BootServices) -> uefi::Result<ScopedProtocol<v2::Tcg>> {
-    let tpm_handle = boot_services.get_handle_for_protocol::<v2::Tcg>()?;
-    let mut tpm_protocol = boot_services.open_protocol_exclusive::<v2::Tcg>(tpm_handle)?;
+fn open_capable_tpm2() -> uefi::Result<ScopedProtocol<v2::Tcg>> {
+    let tpm_handle = boot::get_handle_for_protocol::<v2::Tcg>()?;
+    let mut tpm_protocol = boot::open_protocol_exclusive::<v2::Tcg>(tpm_handle)?;
 
     let capabilities = tpm_protocol.get_capability()?;
 
@@ -29,14 +28,13 @@ fn open_capable_tpm2(boot_services: &BootServices) -> uefi::Result<ScopedProtoco
     Ok(tpm_protocol)
 }
 
-pub fn tpm_available(boot_services: &BootServices) -> bool {
-    open_capable_tpm2(boot_services).is_ok()
+pub fn tpm_available() -> bool {
+    open_capable_tpm2().is_ok()
 }
 
 /// Log an event in the TPM with `buffer` as data.
 /// Returns a boolean whether the measurement has been done or not in case of success.
 pub fn tpm_log_event_ascii(
-    boot_services: &BootServices,
     pcr_index: PcrIndex,
     buffer: &[u8],
     description: &str,
@@ -44,21 +42,16 @@ pub fn tpm_log_event_ascii(
     if pcr_index.0 == u32::MAX {
         return Ok(false);
     }
-    if let Ok(mut tpm2) = open_capable_tpm2(boot_services) {
-        let required_size = mem::size_of::<u32>()
-            // EventHeader is private…
-            + mem::size_of::<u32>() + mem::size_of::<u16>() + mem::size_of::<PcrIndex>() + mem::size_of::<EventType>()
-            + description.len();
+    if let Ok(mut tpm2) = open_capable_tpm2() {
+        let description_encoded = description
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect::<Vec<_>>();
 
-        let mut event_buffer = vec![MaybeUninit::<u8>::uninit(); required_size];
-        let event = v2::PcrEventInputs::new_in_buffer(
-            event_buffer.as_mut_slice(),
-            pcr_index,
-            EventType::IPL,
-            description.as_bytes(),
-        )?;
+        let event = v2::PcrEventInputs::new_in_box(pcr_index, EventType::IPL, &description_encoded)
+            .discard_errdata()?;
         // FIXME: what do we want as flags here?
-        tpm2.hash_log_extend_event(Default::default(), buffer, event)?;
+        tpm2.hash_log_extend_event(Default::default(), buffer, &event)?;
     }
 
     Ok(true)

@@ -1,122 +1,132 @@
-{ pkgs
-, lanzabooteModule
-, evalConfig
-}:
-
-let
+{
+  pkgs,
+  lanzabooteModule,
+  evalConfig,
+}: let
   inherit (pkgs) lib system;
   defaultTimeout = 5 * 60; # = 5 minutes
 
-  mkSecureBootTest = { name, machine ? { }, useSecureBoot ? true, useTPM2 ? false, readEfiVariables ? false, useNetboot ? false, testScript }:
-    let
-      lanzabooteNetbootSystem = (evalConfig {
+  mkSecureBootTest = {
+    name,
+    machine ? {},
+    useSecureBoot ? true,
+    useTPM2 ? false,
+    readEfiVariables ? false,
+    useNetboot ? false,
+    testScript,
+  }: let
+    lanzabooteNetbootSystem =
+      (evalConfig {
         inherit system;
-        modules =
-          [
-            "${pkgs.path}/nixos/modules/installer/netboot/netboot.nix"
-            "${pkgs.path}/nixos/modules/testing/test-instrumentation.nix"
-            lanzabooteModule
-            ({ config, pkgs, ... }: {
-              # We refer to our own NixOS module package rather than pkgs.lzbt
-              # which does not exist in general.
-              # As the flake.nix defines the package in an ad-hoc fashion
-              # rather than using overlays which may not propagate here I guess?
-              system.build.netbootStub = pkgs.runCommand "build-netboot-stub" { } ''
-                mkdir -p $out
-                ${config.boot.lanzaboote.package}/bin/lzbt \
-                  build \
-                  --public-key ${./fixtures/uefi-keys/keys/db/db.pem} \
-                  --private-key ${./fixtures/uefi-keys/keys/db/db.key} \
-                  --initrd ${config.system.build.netbootRamdisk}/initrd \
-                  ${config.system.build.toplevel} > $out/netlanzaboote.efi
-              '';
-            })
-          ];
-      }).config.system;
-      lanzabooteNetbootTree = pkgs.symlinkJoin {
-        name = "ipxeBootDir";
-        paths = [
-          lanzabooteNetbootSystem.build.netbootRamdisk
-          lanzabooteNetbootSystem.build.kernel
-          # Lanzaboote stub for netboot purposes
-          lanzabooteNetbootSystem.build.netbootStub
+        modules = [
+          "${pkgs.path}/nixos/modules/installer/netboot/netboot.nix"
+          "${pkgs.path}/nixos/modules/testing/test-instrumentation.nix"
+          lanzabooteModule
+          ({
+            config,
+            pkgs,
+            ...
+          }: {
+            # We refer to our own NixOS module package rather than pkgs.lzbt
+            # which does not exist in general.
+            # As the flake.nix defines the package in an ad-hoc fashion
+            # rather than using overlays which may not propagate here I guess?
+            system.build.netbootStub = pkgs.runCommand "build-netboot-stub" {} ''
+              mkdir -p $out
+              ${config.boot.lanzaboote.package}/bin/lzbt \
+                build \
+                --public-key ${./fixtures/uefi-keys/keys/db/db.pem} \
+                --private-key ${./fixtures/uefi-keys/keys/db/db.key} \
+                --initrd ${config.system.build.netbootRamdisk}/initrd \
+                ${config.system.build.toplevel} > $out/netlanzaboote.efi
+            '';
+          })
         ];
-      };
-      lanzabooteNetbootFile = "netlanzaboote.efi";
-      tpmSocketPath = "/tmp/swtpm-sock";
-      tpmDeviceModels = {
-        x86_64-linux = "tpm-tis";
-        aarch64-linux = "tpm-tis-device";
-      };
-      # Should go to nixpkgs.
-      efiVariablesHelpers = ''
-        import struct
+      }).config.system;
+    lanzabooteNetbootTree = pkgs.symlinkJoin {
+      name = "ipxeBootDir";
+      paths = [
+        lanzabooteNetbootSystem.build.netbootRamdisk
+        lanzabooteNetbootSystem.build.kernel
+        # Lanzaboote stub for netboot purposes
+        lanzabooteNetbootSystem.build.netbootStub
+      ];
+    };
+    lanzabooteNetbootFile = "netlanzaboote.efi";
+    tpmSocketPath = "/tmp/swtpm-sock";
+    tpmDeviceModels = {
+      x86_64-linux = "tpm-tis";
+      aarch64-linux = "tpm-tis-device";
+    };
+    # Should go to nixpkgs.
+    efiVariablesHelpers = ''
+      import struct
 
-        SD_LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
-        def read_raw_variable(var: str) -> bytes:
-            attr_var = machine.succeed(f"cat /sys/firmware/efi/efivars/{var}-{SD_LOADER_GUID}").encode('raw_unicode_escape')
-            _ = attr_var[:4] # First 4 bytes are attributes according to https://www.kernel.org/doc/html/latest/filesystems/efivarfs.html
-            value = attr_var[4:]
-            return value
-        def read_string_variable(var: str, encoding='utf-16-le') -> str:
-            return read_raw_variable(var).decode(encoding).rstrip('\x00')
-        # By default, it will read a 4 byte value, read `struct` docs to change the format.
-        def assert_variable_uint(var: str, expected: int, format: str = 'I'):
-            with subtest(f"Is `{var}` set to {expected} (uint)"):
-              value, = struct.unpack(f'<{format}', read_raw_variable(var))
-              assert value == expected, f"Unexpected variable value in `{var}`, expected: `{expected}`, actual: `{value}`"
-        def assert_variable_string(var: str, expected: str, encoding='utf-16-le'):
-            with subtest(f"Is `{var}` correctly set"):
-                value = read_string_variable(var, encoding)
-                assert value == expected, f"Unexpected variable value in `{var}`, expected: `{expected.encode(encoding)!r}`, actual: `{value.encode(encoding)!r}`"
-        def assert_variable_string_contains(var: str, expected_substring: str):
-            with subtest(f"Do `{var}` contain expected substrings"):
-                value = read_string_variable(var).strip()
-                assert expected_substring in value, f"Did not find expected substring in `{var}`, expected substring: `{expected_substring}`, actual value: `{value}`"
-      '';
-      tpm2Initialization = ''
-        import subprocess
-        from tempfile import TemporaryDirectory
+      SD_LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+      def read_raw_variable(var: str) -> bytes:
+          attr_var = machine.succeed(f"cat /sys/firmware/efi/efivars/{var}-{SD_LOADER_GUID}").encode('raw_unicode_escape')
+          _ = attr_var[:4] # First 4 bytes are attributes according to https://www.kernel.org/doc/html/latest/filesystems/efivarfs.html
+          value = attr_var[4:]
+          return value
+      def read_string_variable(var: str, encoding='utf-16-le') -> str:
+          return read_raw_variable(var).decode(encoding).rstrip('\x00')
+      # By default, it will read a 4 byte value, read `struct` docs to change the format.
+      def assert_variable_uint(var: str, expected: int, format: str = 'I'):
+          with subtest(f"Is `{var}` set to {expected} (uint)"):
+            value, = struct.unpack(f'<{format}', read_raw_variable(var))
+            assert value == expected, f"Unexpected variable value in `{var}`, expected: `{expected}`, actual: `{value}`"
+      def assert_variable_string(var: str, expected: str, encoding='utf-16-le'):
+          with subtest(f"Is `{var}` correctly set"):
+              value = read_string_variable(var, encoding)
+              assert value == expected, f"Unexpected variable value in `{var}`, expected: `{expected.encode(encoding)!r}`, actual: `{value.encode(encoding)!r}`"
+      def assert_variable_string_contains(var: str, expected_substring: str):
+          with subtest(f"Do `{var}` contain expected substrings"):
+              value = read_string_variable(var).strip()
+              assert expected_substring in value, f"Did not find expected substring in `{var}`, expected substring: `{expected_substring}`, actual value: `{value}`"
+    '';
+    tpm2Initialization = ''
+      import subprocess
+      from tempfile import TemporaryDirectory
 
-        # From systemd-initrd-luks-tpm2.nix
-        class Tpm:
-            def __init__(self):
-                self.state_dir = TemporaryDirectory()
-                self.start()
+      # From systemd-initrd-luks-tpm2.nix
+      class Tpm:
+          def __init__(self):
+              self.state_dir = TemporaryDirectory()
+              self.start()
 
-            def start(self):
-                self.proc = subprocess.Popen(["${pkgs.swtpm}/bin/swtpm",
-                    "socket",
-                    "--tpmstate", f"dir={self.state_dir.name}",
-                    "--ctrl", "type=unixio,path=${tpmSocketPath}",
-                    "--tpm2",
-                    ])
+          def start(self):
+              self.proc = subprocess.Popen(["${pkgs.swtpm}/bin/swtpm",
+                  "socket",
+                  "--tpmstate", f"dir={self.state_dir.name}",
+                  "--ctrl", "type=unixio,path=${tpmSocketPath}",
+                  "--tpm2",
+                  ])
 
-                # Check whether starting swtpm failed
-                try:
-                    exit_code = self.proc.wait(timeout=0.2)
-                    if exit_code is not None and exit_code != 0:
-                        raise Exception("failed to start swtpm")
-                except subprocess.TimeoutExpired:
-                    pass
+              # Check whether starting swtpm failed
+              try:
+                  exit_code = self.proc.wait(timeout=0.2)
+                  if exit_code is not None and exit_code != 0:
+                      raise Exception("failed to start swtpm")
+              except subprocess.TimeoutExpired:
+                  pass
 
-            """Check whether the swtpm process exited due to an error"""
-            def check(self):
-                exit_code = self.proc.poll()
-                if exit_code is not None and exit_code != 0:
-                  raise Exception("swtpm process died")
+          """Check whether the swtpm process exited due to an error"""
+          def check(self):
+              exit_code = self.proc.poll()
+              if exit_code is not None and exit_code != 0:
+                raise Exception("swtpm process died")
 
-        tpm = Tpm()
+      tpm = Tpm()
 
-        @polling_condition
-        def swtpm_running():
-          tpm.check()
-      '';
-      netbootNetworkOptions = ''
-        import os
-        os.environ['QEMU_NET_OPTS'] = ','.join(os.environ.get('QEMU_NET_OPTS', "").split(',') + ["tftp=${lanzabooteNetbootTree}", "bootfile=/${lanzabooteNetbootFile}"])
-      '';
-    in
+      @polling_condition
+      def swtpm_running():
+        tpm.check()
+    '';
+    netbootNetworkOptions = ''
+      import os
+      os.environ['QEMU_NET_OPTS'] = ','.join(os.environ.get('QEMU_NET_OPTS', "").split(',') + ["tftp=${lanzabooteNetbootTree}", "bootfile=/${lanzabooteNetbootFile}"])
+    '';
+  in
     pkgs.nixosTest {
       inherit name;
       globalTimeout = defaultTimeout;
@@ -128,7 +138,11 @@ let
         ${testScript}
       '';
 
-      nodes.machine = { pkgs, lib, ... }: {
+      nodes.machine = {
+        pkgs,
+        lib,
+        ...
+      }: {
         imports = [
           lanzabooteModule
           machine
@@ -152,22 +166,21 @@ let
           # here as well. How painful!
           #
           # See #240.
-          efi.OVMF =
-            let
-              edk2Version = "202305";
-              edk2Src = pkgs.fetchFromGitHub {
-                owner = "tianocore";
-                repo = "edk2";
-                rev = "edk2-stable${edk2Version}";
-                fetchSubmodules = true;
-                hash = "sha256-htOvV43Hw5K05g0SF3po69HncLyma3BtgpqYSdzRG4s=";
-              };
+          efi.OVMF = let
+            edk2Version = "202305";
+            edk2Src = pkgs.fetchFromGitHub {
+              owner = "tianocore";
+              repo = "edk2";
+              rev = "edk2-stable${edk2Version}";
+              fetchSubmodules = true;
+              hash = "sha256-htOvV43Hw5K05g0SF3po69HncLyma3BtgpqYSdzRG4s=";
+            };
 
-              edk2 = pkgs.edk2.overrideAttrs (old: rec {
-                version = edk2Version;
-                src = edk2Src;
-              });
-            in
+            edk2 = pkgs.edk2.overrideAttrs (old: rec {
+              version = edk2Version;
+              src = edk2Src;
+            });
+          in
             (pkgs.OVMF.override {
               secureBoot = useSecureBoot;
               tpmSupport = useTPM2; # This is needed otherwise OVMF won't initialize the TPM2 protocol.
@@ -186,7 +199,7 @@ let
           inherit useSecureBoot;
         };
 
-        boot.initrd.availableKernelModules = lib.mkIf useTPM2 [ "tpm_tis" ];
+        boot.initrd.availableKernelModules = lib.mkIf useTPM2 ["tpm_tis"];
 
         boot.loader.efi = {
           canTouchEfiVariables = true;
@@ -208,40 +221,57 @@ let
   # `src` is copied to `dst` inside th VM. Optionally append some random data
   # ("crap") to the end of the file at `dst`. This is useful to easily change
   # the hash of a file and produce a hash mismatch when booting the stub.
-  mkHashMismatchTest = { name, appendCrapGlob, useSecureBoot ? true }: mkSecureBootTest {
-    inherit name;
-    inherit useSecureBoot;
+  mkHashMismatchTest = {
+    name,
+    appendCrapGlob,
+    useSecureBoot ? true,
+  }:
+    mkSecureBootTest {
+      inherit name;
+      inherit useSecureBoot;
 
-    testScript = ''
-      machine.start()
-      machine.succeed("echo some_garbage_to_change_the_hash | tee -a ${appendCrapGlob} > /dev/null")
-      machine.succeed("sync")
-      machine.crash()
-      machine.start()
-    '' + (if useSecureBoot then ''
-      machine.wait_for_console_text("hash does not match")
-    '' else ''
-      # Just check that the system came up.
-      print(machine.succeed("bootctl", timeout=120))
-    '');
-  };
+      testScript =
+        ''
+          machine.start()
+          machine.succeed("echo some_garbage_to_change_the_hash | tee -a ${appendCrapGlob} > /dev/null")
+          machine.succeed("sync")
+          machine.crash()
+          machine.start()
+        ''
+        + (
+          if useSecureBoot
+          then ''
+            machine.wait_for_console_text("hash does not match")
+          ''
+          else ''
+            # Just check that the system came up.
+            print(machine.succeed("bootctl", timeout=120))
+          ''
+        );
+    };
 
   # The initrd is not directly signed. Its hash is embedded into
   # lanzaboote. To make integrity verification fail, we actually have
   # to modify the initrd. Appending crap to the end is a harmless way
   # that would make the kernel still accept it.
-  mkModifiedInitrdTest = { name, useSecureBoot }: mkHashMismatchTest {
-    inherit name useSecureBoot;
-    appendCrapGlob = "/boot/EFI/nixos/initrd-*.efi";
-  };
+  mkModifiedInitrdTest = {
+    name,
+    useSecureBoot,
+  }:
+    mkHashMismatchTest {
+      inherit name useSecureBoot;
+      appendCrapGlob = "/boot/EFI/nixos/initrd-*.efi";
+    };
 
-  mkModifiedKernelTest = { name, useSecureBoot }: mkHashMismatchTest {
-    inherit name useSecureBoot;
-    appendCrapGlob = "/boot/EFI/nixos/kernel-*.efi";
-  };
-
-in
-{
+  mkModifiedKernelTest = {
+    name,
+    useSecureBoot,
+  }:
+    mkHashMismatchTest {
+      inherit name useSecureBoot;
+      appendCrapGlob = "/boot/EFI/nixos/kernel-*.efi";
+    };
+in {
   # TODO: user mode: OK
   # TODO: how to get in: {deployed, audited} mode ?
   basic = mkSecureBootTest {
@@ -254,7 +284,7 @@ in
 
   systemd-initrd = mkSecureBootTest {
     name = "lanzaboote-systemd-initrd";
-    machine = { ... }: {
+    machine = {...}: {
       boot.initrd.systemd.enable = true;
     };
     testScript = ''
@@ -266,13 +296,12 @@ in
   # Test that a secret is appended to the initrd during installation. Smilar to
   # the initrd-secrets test in Nixpkgs:
   # https://github.com/NixOS/nixpkgs/blob/master/nixos/tests/initrd-secrets.nix
-  initrd-secrets =
-    let
-      secret = (pkgs.writeText "oh-so-secure" "uhh-ooh-uhh-security");
-    in
+  initrd-secrets = let
+    secret = pkgs.writeText "oh-so-secure" "uhh-ooh-uhh-security";
+  in
     mkSecureBootTest {
       name = "lanzaboote-initrd-secrets";
-      machine = { ... }: {
+      machine = {...}: {
         boot.initrd.secrets = {
           "/test" = secret;
         };
@@ -291,7 +320,7 @@ in
 
   # Test that the secrets configured to be appended to the initrd get updated
   # when installing a new generation even if the initrd itself (i.e. its store
-  # path) does not change. 
+  # path) does not change.
   #
   # An unfortunate result of this NixOS feature is that updating the secrets
   # without creating a new initrd might break previous generations. Verify that
@@ -301,14 +330,17 @@ in
   # This tests uses a specialisation to imitate a newer generation. This works
   # because `lzbt` installs the specialisation of a generation AFTER installing
   # the generation itself (thus making the specialisation "newer").
-  initrd-secrets-update =
-    let
-      originalSecret = (pkgs.writeText "oh-so-secure" "uhh-ooh-uhh-security");
-      newSecret = (pkgs.writeText "newly-secure" "so-much-better-now");
-    in
+  initrd-secrets-update = let
+    originalSecret = pkgs.writeText "oh-so-secure" "uhh-ooh-uhh-security";
+    newSecret = pkgs.writeText "newly-secure" "so-much-better-now";
+  in
     mkSecureBootTest {
       name = "lanzaboote-initrd-secrets-update";
-      machine = { pkgs, lib, ... }: {
+      machine = {
+        pkgs,
+        lib,
+        ...
+      }: {
         boot.initrd.secrets = {
           "/test" = lib.mkDefault originalSecret;
         };
@@ -365,7 +397,7 @@ in
 
   specialisation-works = mkSecureBootTest {
     name = "specialisation-still-boot-under-secureboot";
-    machine = { pkgs, ... }: {
+    machine = {pkgs, ...}: {
       specialisation.variant.configuration = {
         environment.systemPackages = [
           pkgs.efibootmgr
@@ -390,7 +422,7 @@ in
   # We test if we can install Lanzaboote without Bootspec support.
   synthesis = mkSecureBootTest {
     name = "lanzaboote-synthesis";
-    machine = { lib, ... }: {
+    machine = {lib, ...}: {
       boot.bootspec.enable = lib.mkForce false;
     };
     testScript = ''
@@ -410,7 +442,7 @@ in
 
       actual_loader_config = machine.succeed("cat /boot/loader/loader.conf").split("\n")
       expected_loader_config = ["timeout 0", "console-mode auto"]
-      
+
       assert all(cfg in actual_loader_config for cfg in expected_loader_config), \
         f"Expected: {expected_loader_config} is not included in actual config: '{actual_loader_config}'"
     '';
@@ -418,7 +450,7 @@ in
 
   export-efi-variables = mkSecureBootTest {
     name = "lanzaboote-exports-efi-variables";
-    machine.environment.systemPackages = [ pkgs.efibootmgr ];
+    machine.environment.systemPackages = [pkgs.efibootmgr];
     readEfiVariables = true;
     testScript = ''
       # We will choose to boot directly on the stub.

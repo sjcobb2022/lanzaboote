@@ -1,8 +1,10 @@
+use alloc::vec::Vec;
 use log::{error, warn};
 use sha2::{Digest, Sha256};
-use uefi::{fs::FileSystem, proto::loaded_image::LoadedImage, prelude::*, CStr16, CString16, Result};
+
 use uefi::proto::network::IpAddress;
 use uefi::proto::network::pxe::{BaseCode, DhcpV4Packet};
+use uefi::{CString16, Result, fs::FileSystem, prelude::*};
 
 use crate::common::{boot_linux_unchecked, extract_string, get_cmdline, get_secure_boot_status};
 use linux_bootloader::pe_section::pe_section;
@@ -48,10 +50,10 @@ fn extract_hash(pe_data: &[u8], section: &str) -> Result<Hash> {
 impl EmbeddedConfiguration {
     fn new(file_data: &[u8]) -> Result<Self> {
         Ok(Self {
-            kernel_filename: extract_string(file_data, ".kernelp")?,
-            kernel_hash: extract_hash(file_data, ".kernelh")?,
+            kernel_filename: extract_string(file_data, ".linux")?,
+            kernel_hash: extract_hash(file_data, ".linuxh")?,
 
-            initrd_filename: extract_string(file_data, ".initrdp")?,
+            initrd_filename: extract_string(file_data, ".initrd")?,
             initrd_hash: extract_hash(file_data, ".initrdh")?,
 
             cmdline: extract_string(file_data, ".cmdline")?,
@@ -77,32 +79,24 @@ fn check_hash(data: &[u8], expected_hash: Hash, name: &str, secure_boot: bool) -
     Ok(())
 }
 
-pub fn boot_linux(handle: Handle, mut system_table: SystemTable<Boot>) -> uefi::Result<()> {
-    uefi_services::init(&mut system_table).unwrap();
-
+pub fn boot_linux(handle: Handle, dynamic_initrds: Vec<Vec<u8>>) -> uefi::Result<()> {
     // SAFETY: We get a slice that represents our currently running
     // image and then parse the PE data structures from it. This is
     // safe, because we don't touch any data in the data sections that
     // might conceivably change while we look at the slice.
     let config = unsafe {
-        EmbeddedConfiguration::new(
-            booted_image_file(system_table.boot_services())
-                .unwrap()
-                .as_slice(),
-        )
-        .expect("Failed to extract configuration from binary. Did you run lzbt?")
+        EmbeddedConfiguration::new(booted_image_file().unwrap().as_slice())
+            .expect("Failed to extract configuration from binary. Did you run lzbt?")
     };
 
-    let secure_boot_enabled = get_secure_boot_status(system_table.runtime_services());
+    let secure_boot_enabled = get_secure_boot_status();
 
     let mut kernel_data;
     let mut initrd_data;
 
     {
-        let file_system = system_table
-            .boot_services()
-            .get_image_file_system(handle)
-            .expect("Failed to get file system handle");
+        let file_system =
+            uefi::boot::get_image_file_system(handle).expect("Failed to get file system handle");
         let mut file_system = FileSystem::new(file_system);
 
         if system_table.boot_services().test_protocol::<uefi::proto::media::fs::SimpleFileSystem>(filesystem_protocol_params).is_ok() {
@@ -158,11 +152,7 @@ pub fn boot_linux(handle: Handle, mut system_table: SystemTable<Boot>) -> uefi::
         }
     }
 
-    let cmdline = get_cmdline(
-        &config.cmdline,
-        system_table.boot_services(),
-        secure_boot_enabled,
-    );
+    let cmdline = get_cmdline(&config.cmdline, secure_boot_enabled);
 
     check_hash(
         &kernel_data,
@@ -177,5 +167,21 @@ pub fn boot_linux(handle: Handle, mut system_table: SystemTable<Boot>) -> uefi::
         secure_boot_enabled,
     )?;
 
-    boot_linux_unchecked(handle, system_table, kernel_data, &cmdline, initrd_data)
+    // Correctness: dynamic initrds are supposed to be validated by caller,
+    // i.e. they are system extension images or credentials
+    // that are supposedly measured in TPM2.
+    // Therefore, it is normal to not verify their hashes against a configuration.
+
+    // Pad to align
+    initrd_data.resize(initrd_data.len().next_multiple_of(4), 0);
+    for mut extra_initrd in dynamic_initrds {
+        // Uncomment for maximal debugging pleasure.
+        // let debug_representation = extra_initrd.as_slice().escape_ascii().collect::<Vec<u8>>();
+        // log::warn!("{:?}", String::from_utf8_lossy(&debug_representation));
+        initrd_data.append(&mut extra_initrd);
+        // Extra initrds ideally should be aligned, but just in case, let's verify this.
+        initrd_data.resize(initrd_data.len().next_multiple_of(4), 0);
+    }
+
+    boot_linux_unchecked(handle, kernel_data, &cmdline, initrd_data)
 }

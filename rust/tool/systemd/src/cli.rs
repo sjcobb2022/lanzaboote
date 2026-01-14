@@ -5,8 +5,10 @@ use clap::{Parser, Subcommand};
 use tempfile::TempDir;
 
 use crate::install;
-use lanzaboote_tool::architecture::Architecture;
-use lanzaboote_tool::signature::KeyPair;
+use lanzaboote_tool::{
+    architecture::Architecture,
+    signature::{EmptyKeyPair, LocalKeyPair},
+};
 use lanzaboote_tool::generation::{GenerationLink, Generation}, pe, os_release::OsRelease, utils::{SecureTempDirExt, assemble_kernel_cmdline}, esp::{EspGenerationPaths, BuildEspPaths, EspPaths}};
 
 /// The default log level.
@@ -64,13 +66,17 @@ struct InstallCommand {
     #[arg(long)]
     systemd_boot_loader_config: PathBuf,
 
+    /// Allow installing unsigned artifacts
+    #[arg(long, num_args = 1)]
+    allow_unsigned: bool,
+
     /// sbsign Public Key
     #[arg(long)]
-    public_key: PathBuf,
+    public_key: Option<PathBuf>,
 
     /// sbsign Private Key
     #[arg(long)]
-    private_key: PathBuf,
+    private_key: Option<PathBuf>,
 
     /// Configuration limit
     #[arg(long, default_value_t = 1)]
@@ -113,19 +119,30 @@ fn install(args: InstallCommand) -> Result<()> {
     let lanzaboote_stub =
         std::env::var("LANZABOOTE_STUB").context("Failed to read LANZABOOTE_STUB env variable")?;
 
-    let key_pair = KeyPair::new(&args.public_key, &args.private_key);
+    let public_key = &args.public_key.expect("Failed to obtain public key");
+    let private_key = &args.private_key.expect("Failed to obtain private key");
 
-    install::Installer::new(
-        PathBuf::from(lanzaboote_stub),
+    let installer_builder = install::InstallerBuilder::new(
+        lanzaboote_stub,
         Architecture::from_nixos_system(&args.system)?,
         args.systemd,
         args.systemd_boot_loader_config,
-        key_pair,
         args.configuration_limit,
         args.esp,
         args.generations,
-    )
-    .install()
+    );
+
+    if args.allow_unsigned
+        && std::fs::exists(public_key).ok().is_none_or(|b| !b)
+        && std::fs::exists(private_key).ok().is_none_or(|b| !b)
+    {
+        log::warn!("No keys provided. Installing unsigned artifacts.");
+        let signer = EmptyKeyPair;
+        installer_builder.build(signer).install()
+    } else {
+        let signer = LocalKeyPair::new(public_key, private_key);
+        installer_builder.build(signer).install()
+    }
 }
 
 fn build(args: BuildCommand) -> Result<()> {
