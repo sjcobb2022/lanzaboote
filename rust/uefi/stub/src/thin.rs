@@ -82,21 +82,23 @@ fn check_hash(data: &[u8], expected_hash: Hash, name: &str, secure_boot: bool) -
 /// Load kernel and initrd via TFTP from the network
 fn load_via_tftp(_handle: Handle) -> uefi::Result<(Vec<u8>, Vec<u8>)> {
     let loaded_image_protocol = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
-        .expect("Failed to open the loaded image protocol on the currently loaded image");
+        .expect("Cannot perform network boot: loaded image protocol unavailable");
 
-    let device_handle = loaded_image_protocol.device().expect("No device handle available");
+    let device_handle = loaded_image_protocol.device()
+        .expect("Cannot perform network boot: no device handle available");
     let mut base_code = boot::open_protocol_exclusive::<BaseCode>(device_handle)
-        .expect("Failed to open PXE BaseCode protocol");
+        .expect("Cannot perform network boot: PXE BaseCode protocol not found on device");
 
     assert!(
         base_code.mode().dhcp_ack_received(),
-        "DHCP acknowledgment not received"
+        "Network boot requires DHCP configuration; ensure the system booted via PXE with DHCP enabled"
     );
     let dhcp_ack: &DhcpV4Packet = base_code.mode().dhcp_ack().as_ref();
     let server_ip = dhcp_ack.bootp_si_addr;
     let server_ip = IpAddr::V4(Ipv4Addr::from(server_ip));
 
     // Use hardcoded filenames for TFTP as in netboot branch
+    // TODO: Consider using embedded configuration paths for more flexibility
     let kernel_filename = cstr8!("./bzImage");
     let initrd_filename = cstr8!("./initrd");
 
@@ -108,8 +110,8 @@ fn load_via_tftp(_handle: Handle) -> uefi::Result<(Vec<u8>, Vec<u8>)> {
         .tftp_get_file_size(&server_ip, initrd_filename)
         .expect("Failed to query initrd file size via TFTP");
 
-    assert!(kfile_size > 0, "Kernel file size is 0");
-    assert!(ifile_size > 0, "Initrd file size is 0");
+    assert!(kfile_size > 0, "TFTP kernel file is empty or does not exist");
+    assert!(ifile_size > 0, "TFTP initrd file is empty or does not exist");
 
     let mut kernel_data = Vec::with_capacity(kfile_size as usize);
     kernel_data.resize(kfile_size as usize, 0);
@@ -123,13 +125,16 @@ fn load_via_tftp(_handle: Handle) -> uefi::Result<(Vec<u8>, Vec<u8>)> {
         .tftp_read_file(&server_ip, initrd_filename, Some(&mut initrd_data))
         .expect("Failed to read initrd file via TFTP");
 
-    assert!(klen > 0, "Kernel read length is 0");
-    assert!(ilen > 0, "Initrd read length is 0");
+    assert!(klen > 0, "TFTP read operation returned 0 bytes for kernel file");
+    assert!(ilen > 0, "TFTP read operation returned 0 bytes for initrd file");
 
     Ok((kernel_data, initrd_data))
 }
 
 pub fn boot_linux(handle: Handle, _dynamic_initrds: Vec<Vec<u8>>) -> uefi::Result<()> {
+    // NOTE: Dynamic initrds (system extensions, credentials) are not supported in netboot mode.
+    // This matches the netboot branch implementation which removed this functionality.
+    // The parameter is kept for API compatibility but is unused.
     // SAFETY: We get a slice that represents our currently running
     // image and then parse the PE data structures from it. This is
     // safe, because we don't touch any data in the data sections that
@@ -155,13 +160,14 @@ pub fn boot_linux(handle: Handle, _dynamic_initrds: Vec<Vec<u8>>) -> uefi::Resul
         if let Ok(file_system_handle) = file_system_result {
             let mut file_system = FileSystem::new(file_system_handle);
             
-            let kernel_result = file_system.read(&*config.kernel_filename);
-            let initrd_result = file_system.read(&*config.initrd_filename);
-
-            if kernel_result.is_ok() && initrd_result.is_ok() {
+            // Try to read kernel and initrd from filesystem
+            if let (Ok(kernel), Ok(initrd)) = (
+                file_system.read(&*config.kernel_filename),
+                file_system.read(&*config.initrd_filename)
+            ) {
                 // Successfully read from filesystem
-                kernel_data = kernel_result.unwrap();
-                initrd_data = initrd_result.unwrap();
+                kernel_data = kernel;
+                initrd_data = initrd;
             } else {
                 // Files not found on filesystem, try network boot
                 warn!("Failed to read kernel/initrd from filesystem, attempting network boot via TFTP");
