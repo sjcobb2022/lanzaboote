@@ -1,4 +1,6 @@
 use alloc::vec::Vec;
+use alloc::format;
+use alloc::string::ToString;
 use log::{error, warn};
 use sha2::{Digest, Sha256};
 use uefi::{CString16, Result, fs::FileSystem, prelude::*};
@@ -11,6 +13,22 @@ use linux_bootloader::pe_section::pe_section;
 use linux_bootloader::uefi_helpers::booted_image_file;
 
 type Hash = sha2::digest::Output<Sha256>;
+
+/// Extract the last component (filename) from a path.
+/// Example: "\\EFI\\NixOS\\kernel-linux-6.12.64.efi" -> "kernel-linux-6.12.64.efi"
+fn extract_filename_from_path(path: &CString16) -> Result<CString16> {
+    // Convert to string to work with
+    let path_str = path.to_string();
+    
+    // Split by both forward and backslash to handle different path formats
+    let filename = path_str
+        .rsplit(|c| c == '\\' || c == '/')
+        .next()
+        .ok_or(Status::INVALID_PARAMETER)?;
+    
+    // Convert back to CString16
+    CString16::try_from(filename).map_err(|_| Status::INVALID_PARAMETER.into())
+}
 
 /// The configuration that is embedded at build time.
 ///
@@ -50,10 +68,10 @@ fn extract_hash(pe_data: &[u8], section: &str) -> Result<Hash> {
 impl EmbeddedConfiguration {
     fn new(file_data: &[u8]) -> Result<Self> {
         Ok(Self {
-            kernel_filename: extract_string(file_data, ".kernelp")?,
-            kernel_hash: extract_hash(file_data, ".kernelh")?,
+            kernel_filename: extract_string(file_data, ".linux")?,
+            kernel_hash: extract_hash(file_data, ".linuxh")?,
 
-            initrd_filename: extract_string(file_data, ".initrdp")?,
+            initrd_filename: extract_string(file_data, ".initrd")?,
             initrd_hash: extract_hash(file_data, ".initrdh")?,
 
             cmdline: extract_string(file_data, ".cmdline")?,
@@ -80,7 +98,11 @@ fn check_hash(data: &[u8], expected_hash: Hash, name: &str, secure_boot: bool) -
 }
 
 /// Load kernel and initrd via TFTP from the network
-fn load_via_tftp(_handle: Handle) -> uefi::Result<(Vec<u8>, Vec<u8>)> {
+fn load_via_tftp(
+    _handle: Handle,
+    kernel_filename: &CString16,
+    initrd_filename: &CString16,
+) -> uefi::Result<(Vec<u8>, Vec<u8>)> {
     let loaded_image_protocol = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
         .expect("Cannot perform network boot: loaded image protocol unavailable");
 
@@ -97,17 +119,38 @@ fn load_via_tftp(_handle: Handle) -> uefi::Result<(Vec<u8>, Vec<u8>)> {
     let server_ip = dhcp_ack.bootp_si_addr;
     let server_ip = IpAddr::V4(Ipv4Addr::from(server_ip));
 
-    // Use hardcoded filenames for TFTP as in netboot branch
-    // TODO: Consider using embedded configuration paths for more flexibility
-    let kernel_filename = cstr8!("./bzImage");
-    let initrd_filename = cstr8!("./initrd");
+    // Extract filenames from the embedded config paths
+    let kernel_file = extract_filename_from_path(kernel_filename)
+        .expect("Failed to extract kernel filename from path");
+    let initrd_file = extract_filename_from_path(initrd_filename)
+        .expect("Failed to extract initrd filename from path");
+    
+    // Convert to UTF-8 CStr8 for TFTP (prepend "./" for relative path)
+    let kernel_path_string = format!("./{}", kernel_file.to_string());
+    let initrd_path_string = format!("./{}", initrd_file.to_string());
+    
+    // Convert strings to CStr8 for TFTP API
+    // TFTP requires ASCII/UTF-8 filenames
+    let kernel_tftp_name = kernel_path_string.as_bytes();
+    let initrd_tftp_name = initrd_path_string.as_bytes();
+    
+    // Allocate buffers for CStr8 with null terminators
+    let mut kernel_tftp_buf = alloc::vec![0u8; kernel_tftp_name.len() + 1];
+    let mut initrd_tftp_buf = alloc::vec![0u8; initrd_tftp_name.len() + 1];
+    kernel_tftp_buf[..kernel_tftp_name.len()].copy_from_slice(kernel_tftp_name);
+    initrd_tftp_buf[..initrd_tftp_name.len()].copy_from_slice(initrd_tftp_name);
+    
+    let kernel_cstr = uefi::CStr8::from_bytes_with_nul(&kernel_tftp_buf)
+        .expect("Failed to create kernel CStr8");
+    let initrd_cstr = uefi::CStr8::from_bytes_with_nul(&initrd_tftp_buf)
+        .expect("Failed to create initrd CStr8");
 
     let kfile_size = base_code
-        .tftp_get_file_size(&server_ip, kernel_filename)
+        .tftp_get_file_size(&server_ip, kernel_cstr)
         .expect("Failed to query kernel file size via TFTP");
 
     let ifile_size = base_code
-        .tftp_get_file_size(&server_ip, initrd_filename)
+        .tftp_get_file_size(&server_ip, initrd_cstr)
         .expect("Failed to query initrd file size via TFTP");
 
     assert!(kfile_size > 0, "TFTP kernel file is empty or does not exist");
@@ -119,10 +162,10 @@ fn load_via_tftp(_handle: Handle) -> uefi::Result<(Vec<u8>, Vec<u8>)> {
     initrd_data.resize(ifile_size as usize, 0);
 
     let klen = base_code
-        .tftp_read_file(&server_ip, kernel_filename, Some(&mut kernel_data))
+        .tftp_read_file(&server_ip, kernel_cstr, Some(&mut kernel_data))
         .expect("Failed to read kernel file via TFTP");
     let ilen = base_code
-        .tftp_read_file(&server_ip, initrd_filename, Some(&mut initrd_data))
+        .tftp_read_file(&server_ip, initrd_cstr, Some(&mut initrd_data))
         .expect("Failed to read initrd file via TFTP");
 
     assert!(klen > 0, "TFTP read operation returned 0 bytes for kernel file");
@@ -171,12 +214,20 @@ pub fn boot_linux(handle: Handle, _dynamic_initrds: Vec<Vec<u8>>) -> uefi::Resul
             } else {
                 // Files not found on filesystem, try network boot
                 warn!("Failed to read kernel/initrd from filesystem, attempting network boot via TFTP");
-                (kernel_data, initrd_data) = load_via_tftp(handle)?;
+                (kernel_data, initrd_data) = load_via_tftp(
+                    handle,
+                    &config.kernel_filename,
+                    &config.initrd_filename,
+                )?;
             }
         } else {
             // Filesystem unavailable, try network boot
             warn!("Filesystem unavailable, attempting network boot via TFTP");
-            (kernel_data, initrd_data) = load_via_tftp(handle)?;
+            (kernel_data, initrd_data) = load_via_tftp(
+                handle,
+                &config.kernel_filename,
+                &config.initrd_filename,
+            )?;
         }
     }
 
