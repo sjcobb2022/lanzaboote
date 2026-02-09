@@ -2,6 +2,9 @@ use alloc::vec::Vec;
 use log::{error, warn};
 use sha2::{Digest, Sha256};
 use uefi::{CString16, Result, fs::FileSystem, prelude::*};
+use uefi::proto::loaded_image::LoadedImage;
+use uefi::proto::network::pxe::{BaseCode, DhcpV4Packet};
+use core::net::{IpAddr, Ipv4Addr};
 
 use crate::common::{boot_linux_unchecked, extract_string, get_cmdline, get_secure_boot_status};
 use linux_bootloader::pe_section::pe_section;
@@ -47,10 +50,10 @@ fn extract_hash(pe_data: &[u8], section: &str) -> Result<Hash> {
 impl EmbeddedConfiguration {
     fn new(file_data: &[u8]) -> Result<Self> {
         Ok(Self {
-            kernel_filename: extract_string(file_data, ".linux")?,
-            kernel_hash: extract_hash(file_data, ".linuxh")?,
+            kernel_filename: extract_string(file_data, ".kernelp")?,
+            kernel_hash: extract_hash(file_data, ".kernelh")?,
 
-            initrd_filename: extract_string(file_data, ".initrd")?,
+            initrd_filename: extract_string(file_data, ".initrdp")?,
             initrd_hash: extract_hash(file_data, ".initrdh")?,
 
             cmdline: extract_string(file_data, ".cmdline")?,
@@ -76,32 +79,99 @@ fn check_hash(data: &[u8], expected_hash: Hash, name: &str, secure_boot: bool) -
     Ok(())
 }
 
-pub fn boot_linux(handle: Handle, dynamic_initrds: Vec<Vec<u8>>) -> uefi::Result<()> {
+/// Load kernel and initrd via TFTP from the network
+fn load_via_tftp(_handle: Handle) -> uefi::Result<(Vec<u8>, Vec<u8>)> {
+    let loaded_image_protocol = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
+        .expect("Failed to open the loaded image protocol on the currently loaded image");
+
+    let device_handle = loaded_image_protocol.device().expect("No device handle available");
+    let mut base_code = boot::open_protocol_exclusive::<BaseCode>(device_handle)
+        .expect("Failed to open PXE BaseCode protocol");
+
+    assert!(
+        base_code.mode().dhcp_ack_received(),
+        "DHCP acknowledgment not received"
+    );
+    let dhcp_ack: &DhcpV4Packet = base_code.mode().dhcp_ack().as_ref();
+    let server_ip = dhcp_ack.bootp_si_addr;
+    let server_ip = IpAddr::V4(Ipv4Addr::from(server_ip));
+
+    // Use hardcoded filenames for TFTP as in netboot branch
+    let kernel_filename = cstr8!("./bzImage");
+    let initrd_filename = cstr8!("./initrd");
+
+    let kfile_size = base_code
+        .tftp_get_file_size(&server_ip, kernel_filename)
+        .expect("Failed to query kernel file size via TFTP");
+
+    let ifile_size = base_code
+        .tftp_get_file_size(&server_ip, initrd_filename)
+        .expect("Failed to query initrd file size via TFTP");
+
+    assert!(kfile_size > 0, "Kernel file size is 0");
+    assert!(ifile_size > 0, "Initrd file size is 0");
+
+    let mut kernel_data = Vec::with_capacity(kfile_size as usize);
+    kernel_data.resize(kfile_size as usize, 0);
+    let mut initrd_data = Vec::with_capacity(ifile_size as usize);
+    initrd_data.resize(ifile_size as usize, 0);
+
+    let klen = base_code
+        .tftp_read_file(&server_ip, kernel_filename, Some(&mut kernel_data))
+        .expect("Failed to read kernel file via TFTP");
+    let ilen = base_code
+        .tftp_read_file(&server_ip, initrd_filename, Some(&mut initrd_data))
+        .expect("Failed to read initrd file via TFTP");
+
+    assert!(klen > 0, "Kernel read length is 0");
+    assert!(ilen > 0, "Initrd read length is 0");
+
+    Ok((kernel_data, initrd_data))
+}
+
+pub fn boot_linux(handle: Handle, _dynamic_initrds: Vec<Vec<u8>>) -> uefi::Result<()> {
     // SAFETY: We get a slice that represents our currently running
     // image and then parse the PE data structures from it. This is
     // safe, because we don't touch any data in the data sections that
     // might conceivably change while we look at the slice.
     let config = unsafe {
-        EmbeddedConfiguration::new(booted_image_file().unwrap().as_slice())
-            .expect("Failed to extract configuration from binary. Did you run lzbt?")
+        EmbeddedConfiguration::new(
+            booted_image_file()
+                .unwrap()
+                .as_slice(),
+        )
+        .expect("Failed to extract configuration from binary. Did you run lzbt?")
     };
 
     let secure_boot_enabled = get_secure_boot_status();
 
     let kernel_data;
-    let mut initrd_data;
+    let initrd_data;
 
     {
-        let file_system =
-            uefi::boot::get_image_file_system(handle).expect("Failed to get file system handle");
-        let mut file_system = FileSystem::new(file_system);
+        // Try to read from filesystem first
+        let file_system_result = uefi::boot::get_image_file_system(handle);
+        
+        if let Ok(file_system_handle) = file_system_result {
+            let mut file_system = FileSystem::new(file_system_handle);
+            
+            let kernel_result = file_system.read(&*config.kernel_filename);
+            let initrd_result = file_system.read(&*config.initrd_filename);
 
-        kernel_data = file_system
-            .read(&*config.kernel_filename)
-            .expect("Failed to read kernel file into memory");
-        initrd_data = file_system
-            .read(&*config.initrd_filename)
-            .expect("Failed to read initrd file into memory");
+            if kernel_result.is_ok() && initrd_result.is_ok() {
+                // Successfully read from filesystem
+                kernel_data = kernel_result.unwrap();
+                initrd_data = initrd_result.unwrap();
+            } else {
+                // Files not found on filesystem, try network boot
+                warn!("Failed to read kernel/initrd from filesystem, attempting network boot via TFTP");
+                (kernel_data, initrd_data) = load_via_tftp(handle)?;
+            }
+        } else {
+            // Filesystem unavailable, try network boot
+            warn!("Filesystem unavailable, attempting network boot via TFTP");
+            (kernel_data, initrd_data) = load_via_tftp(handle)?;
+        }
     }
 
     let cmdline = get_cmdline(&config.cmdline, secure_boot_enabled);
@@ -118,22 +188,6 @@ pub fn boot_linux(handle: Handle, dynamic_initrds: Vec<Vec<u8>>) -> uefi::Result
         "Initrd",
         secure_boot_enabled,
     )?;
-
-    // Correctness: dynamic initrds are supposed to be validated by caller,
-    // i.e. they are system extension images or credentials
-    // that are supposedly measured in TPM2.
-    // Therefore, it is normal to not verify their hashes against a configuration.
-
-    // Pad to align
-    initrd_data.resize(initrd_data.len().next_multiple_of(4), 0);
-    for mut extra_initrd in dynamic_initrds {
-        // Uncomment for maximal debugging pleasure.
-        // let debug_representation = extra_initrd.as_slice().escape_ascii().collect::<Vec<u8>>();
-        // log::warn!("{:?}", String::from_utf8_lossy(&debug_representation));
-        initrd_data.append(&mut extra_initrd);
-        // Extra initrds ideally should be aligned, but just in case, let's verify this.
-        initrd_data.resize(initrd_data.len().next_multiple_of(4), 0);
-    }
 
     boot_linux_unchecked(handle, kernel_data, &cmdline, initrd_data)
 }
