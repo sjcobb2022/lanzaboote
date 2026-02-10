@@ -1,6 +1,6 @@
 use alloc::string::ToString;
+use alloc::vec;
 use alloc::vec::Vec;
-use alloc::{format, vec};
 use core::net::IpAddr;
 use log::{error, warn};
 use sha2::{Digest, Sha256};
@@ -96,9 +96,8 @@ pub fn boot_linux(handle: Handle, dynamic_initrds: Vec<Vec<u8>>) -> uefi::Result
     let kernel_data;
     let mut initrd_data;
 
+    let file_system_result = uefi::boot::get_image_file_system(handle);
     {
-        let file_system_result = uefi::boot::get_image_file_system(handle);
-
         if let Ok(file_system_handle) = file_system_result {
             let mut filesystem = FileSystem::new(file_system_handle);
             (kernel_data, initrd_data) = load_via_fs(
@@ -107,8 +106,7 @@ pub fn boot_linux(handle: Handle, dynamic_initrds: Vec<Vec<u8>>) -> uefi::Result
                 &config.initrd_filename,
             )?;
         } else {
-            (kernel_data, initrd_data) =
-                load_via_tftp(&config.kernel_filename, &config.initrd_filename)?;
+            (kernel_data, initrd_data) = load_via_tftp()?;
         }
     }
 
@@ -178,10 +176,7 @@ fn load_via_fs(
 }
 
 /// Load kernel and initrd via TFTP from the network.
-fn load_via_tftp(
-    kernel_filename: &CString16,
-    initrd_filename: &CString16,
-) -> uefi::Result<(Vec<u8>, Vec<u8>)> {
+fn load_via_tftp() -> uefi::Result<(Vec<u8>, Vec<u8>)> {
     let loaded_image_protocol = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
         .expect("Cannot perform network boot: loaded image protocol unavailable");
 
@@ -199,38 +194,16 @@ fn load_via_tftp(
     let server_ip = dhcp_ack.bootp_si_addr;
     let server_ip = IpAddr::from(server_ip);
 
-    // Extract filenames from the embedded config paths
-    let kernel_file = extract_filename_from_path(kernel_filename)
-        .expect("Failed to extract kernel filename from path");
-    let initrd_file = extract_filename_from_path(initrd_filename)
-        .expect("Failed to extract initrd filename from path");
-
-    // Convert to UTF-8 CStr8 for TFTP (prepend "./" for relative path)
-    let kernel_path_string = format!("./{}", kernel_file);
-    let initrd_path_string = format!("./{}", initrd_file);
-
-    // Convert strings to CStr8 for TFTP API
-    // TFTP requires ASCII/UTF-8 filenames
-    let kernel_tftp_name = kernel_path_string.as_bytes();
-    let initrd_tftp_name = initrd_path_string.as_bytes();
-
-    // Allocate buffers for CStr8 with null terminators
-    let mut kernel_tftp_buf = alloc::vec![0u8; kernel_tftp_name.len() + 1];
-    let mut initrd_tftp_buf = alloc::vec![0u8; initrd_tftp_name.len() + 1];
-    kernel_tftp_buf[..kernel_tftp_name.len()].copy_from_slice(kernel_tftp_name);
-    initrd_tftp_buf[..initrd_tftp_name.len()].copy_from_slice(initrd_tftp_name);
-
-    let kernel_cstr =
-        uefi::CStr8::from_bytes_with_nul(&kernel_tftp_buf).expect("Failed to create kernel CStr8");
-    let initrd_cstr =
-        uefi::CStr8::from_bytes_with_nul(&initrd_tftp_buf).expect("Failed to create initrd CStr8");
+    // TODO:Determine if hardcoding this is necessary (maybe provide ability to pass down from cli.)
+    let bz_image = cstr8!("bzImage");
+    let initrd = cstr8!("initrd");
 
     let kfile_size = base_code
-        .tftp_get_file_size(&server_ip, kernel_cstr)
+        .tftp_get_file_size(&server_ip, bz_image)
         .expect("Failed to query kernel file size via TFTP");
 
     let ifile_size = base_code
-        .tftp_get_file_size(&server_ip, initrd_cstr)
+        .tftp_get_file_size(&server_ip, initrd)
         .expect("Failed to query initrd file size via TFTP");
 
     assert!(
@@ -242,15 +215,19 @@ fn load_via_tftp(
         "TFTP initrd file is empty or does not exist"
     );
 
+    log::warn!("kfile_size = {kfile_size} ifile_size = {ifile_size}");
+
     let mut kernel_data = vec![0; kfile_size as usize];
     let mut initrd_data = vec![0; ifile_size as usize];
 
     let klen = base_code
-        .tftp_read_file(&server_ip, kernel_cstr, Some(&mut kernel_data))
+        .tftp_read_file(&server_ip, bz_image, Some(&mut kernel_data))
         .expect("Failed to read kernel file via TFTP");
     let ilen = base_code
-        .tftp_read_file(&server_ip, initrd_cstr, Some(&mut initrd_data))
+        .tftp_read_file(&server_ip, initrd, Some(&mut initrd_data))
         .expect("Failed to read initrd file via TFTP");
+
+    log::warn!("klen={klen} ilen={ilen}");
 
     assert!(
         klen > 0,
