@@ -1,10 +1,9 @@
-use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
+use alloc::{format, vec};
 use core::net::IpAddr;
 use log::{error, warn};
 use sha2::{Digest, Sha256};
-use uefi::boot::test_protocol;
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::network::pxe::{BaseCode, DhcpV4Packet};
 use uefi::{CString16, Result, fs::FileSystem, prelude::*};
@@ -94,7 +93,7 @@ pub fn boot_linux(handle: Handle, dynamic_initrds: Vec<Vec<u8>>) -> uefi::Result
 
     let secure_boot_enabled = get_secure_boot_status();
 
-    let mut kernel_data;
+    let kernel_data;
     let mut initrd_data;
 
     {
@@ -155,7 +154,7 @@ fn extract_filename_from_path(path: &CString16) -> Result<CString16> {
 
     // Split by both forward and backslash to handle different path formats
     let filename = path_str
-        .rsplit(|c| c == '\\' || c == '/')
+        .rsplit(['\\', '/'])
         .next()
         .ok_or(Status::INVALID_PARAMETER)?;
 
@@ -169,10 +168,10 @@ fn load_via_fs(
     initrd_filename: &CString16,
 ) -> uefi::Result<(Vec<u8>, Vec<u8>)> {
     let kernel_data = file_system
-        .read(&kernel_filename)
+        .read(&**kernel_filename)
         .expect("Failed to read kernel file into memory");
     let initrd_data = file_system
-        .read(&initrd_filename)
+        .read(&**initrd_filename)
         .expect("Failed to read initrd file into memory");
 
     Ok((kernel_data, initrd_data))
@@ -207,8 +206,8 @@ fn load_via_tftp(
         .expect("Failed to extract initrd filename from path");
 
     // Convert to UTF-8 CStr8 for TFTP (prepend "./" for relative path)
-    let kernel_path_string = format!("./{}", kernel_file.to_string());
-    let initrd_path_string = format!("./{}", initrd_file.to_string());
+    let kernel_path_string = format!("./{}", kernel_file);
+    let initrd_path_string = format!("./{}", initrd_file);
 
     // Convert strings to CStr8 for TFTP API
     // TFTP requires ASCII/UTF-8 filenames
@@ -243,10 +242,8 @@ fn load_via_tftp(
         "TFTP initrd file is empty or does not exist"
     );
 
-    let mut kernel_data = Vec::with_capacity(kfile_size as usize);
-    kernel_data.resize(kfile_size as usize, 0);
-    let mut initrd_data = Vec::with_capacity(ifile_size as usize);
-    initrd_data.resize(ifile_size as usize, 0);
+    let mut kernel_data = vec![0; kfile_size as usize];
+    let mut initrd_data = vec![0; ifile_size as usize];
 
     let klen = base_code
         .tftp_read_file(&server_ip, kernel_cstr, Some(&mut kernel_data))
