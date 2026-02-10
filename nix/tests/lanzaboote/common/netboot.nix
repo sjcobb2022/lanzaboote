@@ -32,13 +32,14 @@ let
             # rather than using overlays which may not propagate here I guess?
             system.build.netbootStub = pkgs.runCommand "build-netboot-stub" { } ''
               mkdir -p $out
+              ln -s ${config.system.build.toplevel} system-1-link
               ${config.boot.lanzaboote.package}/bin/lzbt \
                 build \
                 --system ${config.boot.kernelPackages.stdenv.hostPlatform.system} \
                 --public-key ${../../fixtures/uefi-keys/keys/db/db.pem} \
                 --private-key ${../../fixtures/uefi-keys/keys/db/db.key} \
                 --initrd ${config.system.build.netbootRamdisk}/initrd \
-                ${config.system.build.toplevel} > $out/${lanzabooteNetbootFile}
+                system-1-link > $out/${lanzabooteNetbootFile}
             '';
           }
         )
@@ -54,6 +55,7 @@ let
       lanzabooteNetbootSystem.build.netbootStub
     ];
   };
+  # TODO: REPART CONFIG
 in
 {
   options.lanzabooteTest = {
@@ -62,8 +64,11 @@ in
   };
 
   config = {
+    # TODO: Determine if custom options are the best thing for this.
     lanzabooteTest.netbootTree = lanzabooteNetbootTree;
     lanzabooteTest.netbootFile = lanzabooteNetbootFile;
+
+    # TODO: Perhaps disable disk as well. (only tmpfs root).
 
     virtualisation = {
       diskImage = lib.mkForce null;
