@@ -7,7 +7,6 @@
   },
   crane ? import sources.crane { inherit pkgs; },
 }:
-
 let
   inherit (pkgs) lib;
 in
@@ -59,6 +58,7 @@ rec {
     tests = lib.recurseIntoAttrs (
       import ./nix/tests {
         inherit pkgs;
+        lanzabooteModule = nixosModules.lanzaboote;
         extraBaseModules = {
           inherit (nixosModules) lanzaboote;
         };

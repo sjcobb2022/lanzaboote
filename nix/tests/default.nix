@@ -1,16 +1,21 @@
 {
   pkgs,
+  lanzabooteModule,
   extraBaseModules,
-}: let
-  runTest = module:
+  ...
+}:
+let
+  runTest =
+    module:
     pkgs.testers.runNixOSTest {
-      imports = [module];
+      imports = [ module ];
       globalTimeout = 5 * 60;
       extraBaseModules = {
         imports = builtins.attrValues extraBaseModules;
       };
     };
-in {
+in
+{
   basic = runTest ./lanzaboote/basic.nix;
   systemd-initrd = runTest ./lanzaboote/systemd-initrd.nix;
   initrd-secrets = runTest ./lanzaboote/initrd-secrets.nix;
@@ -30,5 +35,10 @@ in {
   systemd-pcrlock = runTest ./lanzaboote/systemd-pcrlock.nix;
   systemd-measured-uki = runTest ./lanzaboote/systemd-measured-uki.nix;
 
-  netboot = runTest ./lanzaboote/netboot.nix;
+  netboot = runTest (
+    import ./lanzaboote/netboot.nix {
+      inherit lanzabooteModule pkgs;
+      inherit (pkgs) lib;
+    }
+  );
 }
