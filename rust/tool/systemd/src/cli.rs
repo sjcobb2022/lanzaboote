@@ -191,7 +191,7 @@ fn build(args: BuildCommand) -> Result<()> {
     let os_release_contents = os_release.to_string();
 
     let arch = Architecture::from_nixos_system(&args.system)?;
-    let mut esp = crate::esp::SystemdEspPaths::new("/", arch);
+    let mut esp = crate::esp::SystemdEspPaths::new(&tempdir, arch);
 
     let kernel_cmdline = assemble_kernel_cmdline(&bootspec.init, bootspec.kernel_params.clone());
 
