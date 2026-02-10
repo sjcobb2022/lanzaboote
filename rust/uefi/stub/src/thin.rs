@@ -144,22 +144,6 @@ pub fn boot_linux(handle: Handle, dynamic_initrds: Vec<Vec<u8>>) -> uefi::Result
     boot_linux_unchecked(handle, kernel_data, &cmdline, initrd_data)
 }
 
-/// Extract the last component (filename) from a path.
-/// Example: "/nix/store/7znxcsd50p2fy18pb25jb3n4ss98dnys-linux-6.12.64/bzImage" -> "bzImage"
-fn extract_filename_from_path(path: &CString16) -> Result<CString16> {
-    // Convert to string to work with
-    let path_str = path.to_string();
-
-    // Split by both forward and backslash to handle different path formats
-    let filename = path_str
-        .rsplit(['\\', '/'])
-        .next()
-        .ok_or(Status::INVALID_PARAMETER)?;
-
-    // Convert back to CString16
-    CString16::try_from(filename).map_err(|_| Status::INVALID_PARAMETER.into())
-}
-
 fn load_via_fs(
     file_system: &mut FileSystem,
     kernel_filename: &CString16,
