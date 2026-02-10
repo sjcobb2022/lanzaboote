@@ -1,12 +1,26 @@
-use std::path::PathBuf;
+use std::{
+    ffi::OsStr,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
+use base32ct::{Base32Unpadded, Encoding};
 use clap::{Parser, Subcommand};
+use tempfile::TempDir;
 
-use crate::install;
+use crate::{
+    esp::SystemdEspPaths,
+    install::{self},
+};
 use lanzaboote_tool::{
     architecture::Architecture,
-    signature::{EmptyKeyPair, LocalKeyPair},
+    esp::EspPaths,
+    generation::{Generation, GenerationLink},
+    os_release::OsRelease,
+    pe::StubParameters,
+    signature::{EmptyKeyPair, LocalKeyPair, Signer},
+    utils::{assemble_kernel_cmdline, file_hash, install as install_to},
 };
 
 /// The default log level.
@@ -29,6 +43,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Install(InstallCommand),
+    Build(BuildCommand),
 }
 
 #[derive(Parser)]
@@ -72,6 +87,28 @@ struct InstallCommand {
     generations: Vec<PathBuf>,
 }
 
+#[derive(Parser)]
+struct BuildCommand {
+    /// System for lanzaboote binaries, e.g. defines the EFI fallback path
+    #[arg(long)]
+    system: String,
+
+    /// sbsign Public Key
+    #[arg(long)]
+    public_key: PathBuf,
+
+    /// sbsign Private Key
+    #[arg(long)]
+    private_key: PathBuf,
+
+    /// Override initrd
+    #[arg(long)]
+    initrd: PathBuf,
+
+    /// Generation
+    generation: PathBuf,
+}
+
 impl Cli {
     pub fn call(self, module: &str) {
         stderrlog::new()
@@ -93,6 +130,7 @@ impl Commands {
     pub fn call(self) -> Result<()> {
         match self {
             Commands::Install(args) => install(args),
+            Commands::Build(args) => build(args),
         }
     }
 }
@@ -126,4 +164,96 @@ fn install(args: InstallCommand) -> Result<()> {
         let signer = LocalKeyPair::new(public_key, private_key);
         installer_builder.build(signer).install()
     }
+}
+
+fn build(args: BuildCommand) -> Result<()> {
+    let lanzaboote_stub = PathBuf::from(
+        std::env::var("LANZABOOTE_STUB").context("Failed to read LANZABOOTE_STUB env variable")?,
+    );
+
+    let public_key = &args.public_key;
+    let private_key = &args.private_key;
+    let signer = LocalKeyPair::new(public_key, private_key);
+
+    let link = GenerationLink::from_path(&args.generation).with_context(|| {
+        format!(
+            "Failed to build generation from link: {0:?}",
+            args.generation
+        )
+    })?;
+
+    let generation = Generation::from_link(&link)?;
+    let bootspec = &generation.spec.bootspec.bootspec;
+
+    let tempdir = TempDir::new().context("Failed to create temporary directory")?;
+    let os_release = OsRelease::from_generation(&generation)
+        .context("Failed to build OsRelease from generation.")?;
+    let os_release_contents = os_release.to_string();
+
+    let arch = Architecture::from_nixos_system(&args.system)?;
+    let mut esp = crate::esp::SystemdEspPaths::new("/", arch);
+
+    let kernel_cmdline = assemble_kernel_cmdline(&bootspec.init, bootspec.kernel_params.clone());
+
+    let kernel_dirname = bootspec
+        .kernel
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str)
+        .context("Failed to extract the kernel directory name.")?;
+
+    let kernel_version = kernel_dirname
+        .rsplit('-')
+        .next()
+        .context("Failed to extract the kernel version.")?;
+
+    let kernel_target = install_ca(
+        &mut esp,
+        &bootspec.kernel,
+        &format!("kernel-{}", kernel_version),
+    )
+    .context("Failed to install the kernel.")?;
+
+    let initrd = bootspec
+        .initrd
+        .clone()
+        .expect("Lanzaboote does not support missing initrd yet.");
+
+    let initrd_target = install_ca(&mut esp, &initrd, &format!("initrd-{}", kernel_version))
+        .context("Failed to install the initrd.")?;
+
+    let stub_parameters = StubParameters::new(
+        lanzaboote_stub.as_path(),
+        &bootspec.kernel,
+        &initrd,
+        &kernel_target,
+        &initrd_target,
+        &esp.esp,
+    )?
+    .with_cmdline(&kernel_cmdline)
+    .with_os_release_contents(os_release_contents.as_bytes());
+
+    let lzbt_stub = lanzaboote_tool::pe::lanzaboote_image(&tempdir, &stub_parameters)?;
+
+    let to = tempdir.path().join("signed-lzbt-stub.efi");
+
+    signer
+        .sign_and_copy(&lzbt_stub, &to)
+        .with_context(|| format!("Failed to copy and sign file {lzbt_stub:?} to {to:?}"))?;
+
+    std::io::stdout().write_all(&std::fs::read(to)?)?;
+
+    Ok(())
+}
+
+fn install_ca(esp: &mut SystemdEspPaths, from: &Path, label: &str) -> Result<PathBuf> {
+    let hash = file_hash(from).context("Failed to read the source file.")?;
+    let to = esp.nixos.join(format!(
+        "{}-{}.efi",
+        label,
+        Base32Unpadded::encode_string(&hash)
+    ));
+
+    install_to(from, &to)?;
+    Ok(to)
 }
