@@ -72,6 +72,7 @@ in
 
     virtualisation = {
       diskImage = lib.mkForce null;
+      memorySize = 2048;
 
       # TFTP settings for netbooting form qemu's built in system.
       qemu.networkingOptions = lib.mkForce [
