@@ -95,8 +95,8 @@ pub fn boot_linux(handle: Handle, dynamic_initrds: Vec<Vec<u8>>) -> uefi::Result
     let kernel_data;
     let mut initrd_data;
 
-    let file_system_result = uefi::boot::get_image_file_system(handle);
     {
+        let file_system_result = uefi::boot::get_image_file_system(handle);
         if let Ok(file_system_handle) = file_system_result {
             let mut filesystem = FileSystem::new(file_system_handle);
             (kernel_data, initrd_data) = load_via_fs(
