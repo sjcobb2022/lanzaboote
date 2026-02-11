@@ -178,8 +178,8 @@ fn load_via_tftp() -> uefi::Result<(Vec<u8>, Vec<u8>)> {
     let server_ip = IpAddr::from(server_ip);
 
     // TODO:Determine if hardcoding this is necessary (maybe provide ability to pass down from cli.)
-    let bz_image = cstr8!("bzImage");
-    let initrd = cstr8!("initrd");
+    let bz_image = cstr8!("./bzImage");
+    let initrd = cstr8!("./initrd");
 
     let kfile_size = base_code
         .tftp_get_file_size(&server_ip, bz_image)
